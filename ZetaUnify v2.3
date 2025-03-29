@@ -1,0 +1,201 @@
+import numpy as np
+import mpmath
+import matplotlib.pyplot as plt
+from scipy.interpolate import RegularGridInterpolator
+from numba import jit
+import vegas  # For Monte Carlo integration
+
+# Set precision for mpmath
+mpmath.mp.dps = 30
+
+# Precompute and cache zeta values for efficient lookup
+def precompute_zeta_grid(t_min=0, t_max=100, num_points=1000):
+    """Precompute zeta values on a grid for interpolation"""
+    t_values = np.linspace(t_min, t_max, num_points)
+    zeta_real = np.zeros(num_points)
+    zeta_imag = np.zeros(num_points)
+    
+    print("Precomputing zeta values...")
+    for i, t in enumerate(t_values):
+        if i % 100 == 0:
+            print(f"Computing point {i}/{num_points}")
+        
+        z = complex(mpmath.zeta(0.5 + 1j*t))
+        zeta_real[i] = float(z.real)
+        zeta_imag[i] = float(z.imag)
+    
+    return t_values, zeta_real, zeta_imag
+
+# Create fast interpolation function
+def create_zeta_interpolator(t_values, zeta_real, zeta_imag):
+    """Create a fast interpolation function for zeta"""
+    real_interp = RegularGridInterpolator((t_values,), zeta_real, 
+                                         bounds_error=False, fill_value=None)
+    imag_interp = RegularGridInterpolator((t_values,), zeta_imag,
+                                         bounds_error=False, fill_value=None)
+    
+    def zeta_interp(s):
+        """Fast interpolated zeta function"""
+        # Handle s = 0.5 + it format
+        if isinstance(s, complex):
+            t = abs(float(s.imag))
+        else:
+            # Assume t directly provided
+            t = float(s)
+        
+        # Return interpolated value
+        return complex(float(real_interp([t])[0]), float(imag_interp([t])[0]))
+    
+    return zeta_interp
+
+# Asymptotic approximation for large t
+def zeta_asymptotic(s):
+    """Asymptotic approximation of zeta for large imaginary part"""
+    if isinstance(s, complex):
+        sigma = float(s.real)
+        t = float(s.imag)
+    else:
+        sigma = 0.5
+        t = float(s)
+    
+    # Simple approximation using leading terms of Riemann-Siegel formula
+    # Note: A full implementation would include more terms
+    if abs(t) > 1000:
+        phase = t/2 * np.log(t/(2*np.pi)) - t/2 - np.pi/8
+        return 2 * np.cos(phase)
+    else:
+        # Fall back to exact calculation
+        return complex(mpmath.zeta(complex(sigma, t)))
+
+# Optimized zeta function implementation
+def fast_zeta(s, zeta_interp, t_threshold=100):
+    """Fast zeta function implementation using interpolation and asymptotics"""
+    if isinstance(s, complex):
+        t = abs(float(s.imag))
+    else:
+        t = float(s)
+    
+    if t < t_threshold:
+        return zeta_interp(s)
+    else:
+        return zeta_asymptotic(s)
+
+# Modified propagator for scalar field
+def zeta_modified_propagator(k, m, zeta_func, q=None):
+    """
+    Compute the zeta-modified propagator
+    
+    Parameters:
+        k: 4-momentum (k0, k1, k2, k3)
+        m: mass
+        zeta_func: fast zeta function to use
+        q: reference momentum (optional)
+    
+    Returns:
+        Complex value of the propagator
+    """
+    k_sq = k[0]**2 - k[1]**2 - k[2]**2 - k[3]**2
+    
+    # Compute s = 1/2 + i|k-q|
+    if q is None:
+        k_mag = np.sqrt(abs(k[1]**2 + k[2]**2 + k[3]**2))
+    else:
+        k_diff = np.array([k[0]-q[0], k[1]-q[1], k[2]-q[2], k[3]-q[3]])
+        k_mag = np.sqrt(abs(k_diff[1]**2 + k_diff[2]**2 + k_diff[3]**2))
+    
+    s = complex(0.5, k_mag)
+    zeta_val = zeta_func(s)
+    
+    # Small epsilon for numerical stability
+    epsilon = 1e-6
+    
+    # Return the modified propagator
+    return 1j / (k_sq - m**2 + zeta_val + 1j*epsilon)
+
+# One-loop self-energy with zeta-modified propagators
+def compute_self_energy(p_external, m, zeta_func):
+    """
+    Compute the one-loop self-energy with zeta-modified propagators
+    using Monte Carlo integration
+    
+    Parameters:
+        p_external: External momentum 4-vector
+        m: Mass
+        zeta_func: Fast zeta function implementation
+    
+    Returns:
+        Self-energy value (complex)
+    """
+    # Define the integrand for Vegas
+    @jit(nopython=True)
+    def integrand(k_eucl):
+        # Convert from Euclidean to Minkowski
+        k = np.array([1j*k_eucl[0], k_eucl[1], k_eucl[2], k_eucl[3]])
+        
+        # First propagator
+        prop1 = zeta_modified_propagator(k, m, zeta_func)
+        
+        # Second propagator
+        p_minus_k = np.array([p_external[0]-k[0], p_external[1]-k[1], 
+                             p_external[2]-k[2], p_external[3]-k[3]])
+        prop2 = zeta_modified_propagator(p_minus_k, m, zeta_func)
+        
+        # Jacobian from Wick rotation
+        jacobian = 1j
+        
+        return jacobian * prop1 * prop2
+    
+    # Set up Vegas integrator
+    integ = vegas.Integrator([[-50, 50], [-50, 50], [-50, 50], [-50, 50]])
+    
+    # Run the integration
+    result = integ(integrand, nitn=10, neval=10000)
+    
+    # Normalization factor
+    norm = 1.0 / (2*np.pi)**4
+    
+    return norm * result
+
+# Main function to run the calculation
+def main():
+    # Precompute zeta values
+    t_values, zeta_real, zeta_imag = precompute_zeta_grid(0, 200, 2000)
+    zeta_interp = create_zeta_interpolator(t_values, zeta_real, zeta_imag)
+    
+    # Create our fast zeta function
+    def zeta_fast(s):
+        return fast_zeta(s, zeta_interp, t_threshold=200)
+    
+    # Test it on some values
+    test_points = [0.5, 14.135, 21.022, 50.0, 100.0]
+    for t in test_points:
+        s = complex(0.5, t)
+        exact = complex(mpmath.zeta(s))
+        approx = zeta_fast(s)
+        print(f"t = {t:.3f}: Exact = {exact}, Approx = {approx}, Error = {abs(exact-approx)}")
+    
+    # Calculate self-energy for different external momenta
+    p_values = np.linspace(1, 10, 10)
+    self_energies = []
+    
+    for p_val in p_values:
+        p_external = np.array([p_val, 0, 0, 0])
+        self_energy = compute_self_energy(p_external, m=1.0, zeta_func=zeta_fast)
+        self_energies.append(complex(self_energy))
+        print(f"p = {p_val:.2f}, Σ(p) = {self_energy}")
+    
+    # Plot the results
+    plt.figure(figsize=(10, 6))
+    plt.plot(p_values, [se.real for se in self_energies], 'b-', label='Re[Σ(p)]')
+    plt.plot(p_values, [se.imag for se in self_energies], 'r--', label='Im[Σ(p)]')
+    plt.xlabel('External momentum p')
+    plt.ylabel('Self-energy Σ(p)')
+    plt.title('Zeta-modified scalar self-energy')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('zeta_self_energy.png')
+    
+    return self_energies
+
+if __name__ == "__main__":
+    main()
